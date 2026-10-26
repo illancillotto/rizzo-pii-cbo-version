@@ -7,9 +7,11 @@ All errors deliberately omit file content and user-supplied part names.
 from __future__ import annotations
 
 import copy
+import datetime
 import hashlib
 import io
 import json
+import math
 import os
 import posixpath
 import re
@@ -140,6 +142,26 @@ def detector_text(slot):
     if slot.get("field") in {"oddHeader", "oddFooter", "evenHeader", "evenFooter", "firstHeader", "firstFooter"}:
         value = HEADER_CODE.sub(lambda m: " " * len(m.group()), value)
     return value
+
+
+def validate_scalar(value, kind):
+    valid = True
+    if kind in {"n", "metadata_number"}:
+        valid = bool(re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", value))
+        if valid:
+            valid = math.isfinite(float(value))
+    elif kind in {"b", "metadata_bool"}:
+        valid = value in ({"0", "1"} if kind == "b" else {"0", "1", "true", "false"})
+    elif kind in {"d", "metadata_date"}:
+        try:
+            datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            valid = False
+    elif kind == "e":
+        valid = value in {"#NULL!", "#DIV/0!", "#VALUE!", "#REF!", "#NAME?", "#NUM!", "#N/A",
+                          "#GETTING_DATA", "#SPILL!", "#CALC!", "#FIELD!", "#DATA!", "#CONNECT!", "#BLOCKED!"}
+    if not valid:
+        raise XlsxError("Valore numerico, data, booleano o errore Excel non valido.")
 
 
 def local(tag):
@@ -467,6 +489,7 @@ class Package:
                             root.remove(node)
 
     def _slot(self, part, node, value, kind="text", **meta):
+        validate_scalar(value, kind)
         if len(value.encode("utf-16-le")) // 2 > self.limits.cell_length:
             raise XlsxError("Superata la lunghezza massima di una cella.")
         if meta.get("field") in {"oddHeader", "oddFooter", "evenHeader", "evenFooter", "firstHeader", "firstFooter"} and len(value.encode("utf-16-le")) // 2 > 255:
@@ -824,6 +847,7 @@ class WorkbookJob:
                                 break
                         if hint and hint not in self.excluded and slot["row"] != header_row:
                             entities = [{"start": 0, "end": len(slot["value"]), "label": hint, "source": "header"}]
+                accepted_spans = []
                 for entity in entities:
                     start, end, category = entity["start"], entity["end"], entity["label"]
                     if not 0 <= start < end <= len(slot["value"]):
@@ -832,9 +856,9 @@ class WorkbookJob:
                         # Numeric identifiers become text pseudonyms; their exact
                         # lexical value and Excel type are restored by the dictionary.
                         start, end = 0, len(slot["value"])
-                    if any(c["slot"] == slot["id"] and c["start"] < end and start < c["end"]
-                           for c in self.changes):
+                    if any(left < end and start < right for left, right in accepted_spans):
                         continue
+                    accepted_spans.append((start, end))
                     association = self.session.placeholder(category, slot["value"][start:end], slot["kind"])
                     ph = NEUTRAL.get(slot["kind"], association)
                     self.changes.append({"id": len(self.changes), "slot": slot["id"],
@@ -1107,6 +1131,7 @@ def restore(data, dictionary, limits=None):
                 edit["cell_type"] not in {None, "n", "b", "d", "e", "str", "inlineStr"}):
             raise XlsxError("Valore o tipo di ripristino non valido.")
         matches = PLACEHOLDER.findall(edit["expected"])
+        validate_scalar(edit["original"], edit["kind"])
         neutral = edit["kind"] in NEUTRAL and slot["kind"] == edit["kind"] and edit["expected"] == NEUTRAL[edit["kind"]]
         added = set(matches) - set(PLACEHOLDER.findall(edit["original"]))
         if not neutral and (not added or any("RZ_" + dictionary["namespace"] + "_" not in ph for ph in added)):

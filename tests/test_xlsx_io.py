@@ -458,6 +458,24 @@ class XlsxFlow(unittest.TestCase):
         with self.assertRaises(XlsxError):
             Limits(cell_length=40000)
 
+    def test_invalid_native_scalar_types_and_concatenation_rejected(self):
+        raw = save(workbook({"A1": 17}))
+        for value in [b'not-a-number', b'1e99999']:
+            with self.assertRaises(XlsxError):
+                WorkbookJob(mutate(raw, {"xl/worksheets/sheet1.xml": lambda v: v.replace(b'<v>17</v>', b'<v>' + value + b'</v>')}))
+        with self.assertRaises(XlsxError):
+            WorkbookJob(save(workbook({"A1": '=33&1234567'})))
+
+    def test_reprocessed_file_requires_its_own_dictionary(self):
+        first = self.job(); raw = first.export(fake_batch)
+        second = WorkbookJob(raw); second.analyze(fake_batch, {"columns": [
+            {"sheet": 0, "column": 1, "header_row": 0, "start_row": 1}]})
+        new_raw = second.export(fake_batch)
+        with self.assertRaisesRegex(XlsxError, "SHA-256"):
+            restore(new_raw, first.dictionary)
+        recovered = load_workbook(io.BytesIO(restore(new_raw, second.dictionary)))
+        self.assertEqual(recovered.active["A2"].value, load_workbook(io.BytesIO(raw)).active["A2"].value)
+
 
 
 if __name__ == "__main__":
