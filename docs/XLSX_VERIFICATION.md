@@ -47,6 +47,12 @@ defusedxml e li importa prima dei test; esegue realmente la suite XLSX su Python
 branch e sulle PR interessate. Nessun job leggero viene presentato come test del
 modello. Le esecuzioni GitHub effettive vanno controllate sul commit pubblicato.
 
+Esecuzione remota completata: [GitHub Actions 40350852617](https://github.com/illancillotto/rizzo-pii-cbo-version/actions/runs/40350852617),
+commit di codice/distribuzione `1b8e0d5a8aedb7b17c5bb102bb81d87c4c83f011`.
+Entrambi i job `xlsx (3.11)` e `xlsx (3.14)` sono **success**: suite XLSX/API,
+regressione JS e verifica sintassi eseguite realmente. L'aggiornamento successivo
+di questo rapporto modifica soltanto la documentazione.
+
 ## Prove complete
 
 **Modello reale, API — PASS.** `scripts/check_xlsx_real_model.py` importa l'app
