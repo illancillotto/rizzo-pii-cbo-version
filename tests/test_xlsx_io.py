@@ -438,6 +438,7 @@ class XlsxFlow(unittest.TestCase):
             archive.comment = b"uninspectable metadata"
         with self.assertRaisesRegex(XlsxError, "ZIP"):
             WorkbookJob(stream.getvalue())
+
         stream = io.BytesIO(raw)
         import warnings
         with warnings.catch_warnings():
@@ -446,6 +447,17 @@ class XlsxFlow(unittest.TestCase):
                 archive.writestr("xl/workbook.xml", b"duplicate")
         with self.assertRaisesRegex(XlsxError, "duplicate"):
             WorkbookJob(stream.getvalue())
+
+    def test_merged_area_utf16_and_excel_bounds_checked_before_reader(self):
+        raw = mutate(save(workbook()), {"xl/worksheets/sheet1.xml": lambda v: v.replace(
+            b'</worksheet>', b'<mergeCells count="1"><mergeCell ref="A1:XFD1048576"/></mergeCells></worksheet>')})
+        with self.assertRaisesRegex(XlsxError, "celle unite"):
+            WorkbookJob(raw)
+        with self.assertRaises(XlsxError):
+            WorkbookJob(save(workbook({"A1": "😀" * 20000})))
+        with self.assertRaises(XlsxError):
+            Limits(cell_length=40000)
+
 
 
 if __name__ == "__main__":

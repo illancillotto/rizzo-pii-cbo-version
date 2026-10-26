@@ -54,6 +54,11 @@ class Limits:
     xml_nodes: int = 200000
     seconds: int = 120
 
+    def __post_init__(self):
+        if any(type(getattr(self, name)) is not int or getattr(self, name) <= 0
+               for name in self.__dataclass_fields__) or self.cell_length > 32767:
+            raise XlsxError("Limiti XLSX non validi; le celle non possono superare 32767 unità UTF-16.")
+
     @classmethod
     def environment(cls):
         values = {}
@@ -462,8 +467,10 @@ class Package:
                             root.remove(node)
 
     def _slot(self, part, node, value, kind="text", **meta):
-        if len(value) > self.limits.cell_length:
+        if len(value.encode("utf-16-le")) // 2 > self.limits.cell_length:
             raise XlsxError("Superata la lunghezza massima di una cella.")
+        if meta.get("field") in {"oddHeader", "oddFooter", "evenHeader", "evenFooter", "firstHeader", "firstFooter"} and len(value.encode("utf-16-le")) // 2 > 255:
+            raise XlsxError("Intestazione o piè di pagina oltre il limite Excel di 255 caratteri.")
         if re.search(r"_x[0-9a-fA-F]{4}_", value):
             raise XlsxError("Sequenze di escape OOXML nei dati non supportate: salvare una copia con testo semplice.")
         slot = {"id": len(self.slots), "part": part, "node": node, "value": value,
@@ -483,15 +490,30 @@ class Package:
         sheets = workbook.findall("m:sheets/m:sheet", NS)
         if not 0 < len(sheets) <= self.limits.sheets:
             raise XlsxError("Superato il limite di fogli o cartella vuota.")
-        processed, count, area, actual_area = set(), 0, 0, 0
+        processed, count, area, actual_area, merged_total = set(), 0, 0, 0, 0
+        titles = set()
         for index, sheet in enumerate(sheets):
             part = targets.get(sheet.get("{" + OREL + "}id"))
             if part not in self.roots or part in processed:
                 raise XlsxError("Riferimenti dei fogli non validi.")
             processed.add(part)
             title = sheet.get("name", "")
+            if (not title or len(title.encode("utf-16-le")) // 2 > 31 or
+                    re.search(r"[\\/*?:\[\]]", title) or title.casefold() in titles):
+                raise XlsxError("Nomi di foglio duplicati o non validi per Excel.")
+            titles.add(title.casefold())
             self.names.append(title)
             root = self.roots[part]
+            for merge in root.findall("m:mergeCells/m:mergeCell", NS):
+                try:
+                    a, b, c, d = range_boundaries(merge.get("ref", ""))
+                    if not (1 <= a <= c <= 16384 and 1 <= b <= d <= 1048576):
+                        raise ValueError
+                    merged_total += (c - a + 1) * (d - b + 1)
+                except Exception:
+                    raise XlsxError("Intervallo di celle unite non valido.") from None
+                if merged_total > self.limits.cells:
+                    raise XlsxError("Area di celle unite oltre il budget XLSX.")
             dim = root.find("m:dimension", NS)
             try:
                 bounds = range_boundaries(dim.get("ref")) if dim is not None else (1, 1, 1, 1)
@@ -509,6 +531,8 @@ class Package:
                 if not re.fullmatch(r"[A-Z]{1,3}[1-9][0-9]*", coordinate):
                     raise XlsxError("Coordinata di cella non valida.")
                 col, row, _, _ = range_boundaries(coordinate)
+                if col > 16384 or row > 1048576:
+                    raise XlsxError("Cella oltre i limiti del formato Excel.")
                 max_row, max_col = max(max_row, row), max(max_col, col)
                 if row * col > self.limits.cells or (index, coordinate) in self.cells:
                     raise XlsxError("Cella duplicata o fuori dal budget di area.")
@@ -664,6 +688,9 @@ class Package:
                 if token.subtype == "OPEN" and token.value.upper() not in {
                         "SUM(", "MIN(", "MAX(", "AVERAGE(", "COUNT(", "ABS(", "ROUND("}:
                     raise XlsxError("Funzione Excel non supportata.")
+            elif token.type.startswith("OPERATOR-") and token.value not in {
+                    "+", "-", "*", "/", "^", "%", "=", "<", ">", "<=", ">=", "<>"}:
+                raise XlsxError("Operatore di formula non supportato (inclusa concatenazione).")
             elif token.type not in {"OPERATOR-PREFIX", "OPERATOR-INFIX", "OPERATOR-POSTFIX", "PAREN", "SEP", "WHITE-SPACE"}:
                 raise XlsxError("Formula non supportata.")
         if not tokens:
@@ -979,6 +1006,10 @@ class WorkbookJob:
                 value = value[:change["start"]] + change["replacement"] + value[change["end"]:]
             if len(value) > p.limits.cell_length:
                 raise XlsxError("La sostituzione supera la lunghezza massima della cella.")
+            if len(value.encode("utf-16-le")) // 2 > p.limits.cell_length:
+                raise XlsxError("La sostituzione supera il limite UTF-16 della cella.")
+            if slot.get("field") in {"oddHeader", "oddFooter", "evenHeader", "evenFooter", "firstHeader", "firstFooter"} and len(value.encode("utf-16-le")) // 2 > 255:
+                raise XlsxError("La sostituzione supera il limite di 255 caratteri dell'intestazione o piè di pagina.")
             if self.session.mapping_enabled:
                 restoration.append({"slot": slot_id, "expected": value, "original": old,
                                     "kind": slot["kind"], "cell_type": slot.get("cell_type")})
