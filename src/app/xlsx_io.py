@@ -135,6 +135,8 @@ CELL_REF = re.compile(r"\$?[A-Z]{1,3}\$?[1-9][0-9]*(?::\$?[A-Z]{1,3}\$?[1-9][0-9
 PLACEHOLDER = re.compile(r"\[\[RZ_[a-f0-9]{16}_[A-Z][A-Z0-9_]{0,31}_[1-9][0-9]*\]\]")
 NEUTRAL = {"metadata_date": "2000-01-01T00:00:00Z", "metadata_number": "0", "metadata_bool": "false"}
 HEADER_CODE = re.compile(r'&(?:"[^"\n]{0,512}"|K[0-9A-Fa-f]{6}|[0-9]{1,3}|[LCRPNDTAFZBIUESXY])')
+SAFE_FONTS = {"Calibri", "Arial", "Times New Roman", "Cambria", "Helvetica", "Verdana",
+              "Courier New", "Segoe UI", "Tahoma", "Symbol"}
 
 
 def detector_text(slot):
@@ -494,6 +496,12 @@ class Package:
             raise XlsxError("Superata la lunghezza massima di una cella.")
         if meta.get("field") in {"oddHeader", "oddFooter", "evenHeader", "evenFooter", "firstHeader", "firstFooter"} and len(value.encode("utf-16-le")) // 2 > 255:
             raise XlsxError("Intestazione o piè di pagina oltre il limite Excel di 255 caratteri.")
+        if meta.get("field") in {"oddHeader", "oddFooter", "evenHeader", "evenFooter", "firstHeader", "firstFooter"}:
+            for font in re.findall(r'&"([^"\n]*)"', value):
+                pieces = font.split(",")
+                if pieces[0] not in SAFE_FONTS or (len(pieces) > 1 and pieces[1] not in {
+                        "Regular", "Bold", "Italic", "Bold Italic"}) or len(pieces) > 2:
+                    raise XlsxError("Font di intestazione/piè di pagina non supportato: usare un font standard.")
         if re.search(r"_x[0-9a-fA-F]{4}_", value):
             raise XlsxError("Sequenze di escape OOXML nei dati non supportate: salvare una copia con testo semplice.")
         slot = {"id": len(self.slots), "part": part, "node": node, "value": value,
@@ -685,9 +693,7 @@ class Package:
                                  (local(attr) == "id" and value in {"anysvml", "comments"}) or
                                  re.fullmatch(r"#?_x0000_[st][0-9]+", value) or
                                  (attr in {"rgb", "val"} and re.fullmatch(r"[A-Fa-f0-9]{6,8}", value)))
-                    safe_font = local(node.tag) == "name" and attr == "val" and value in {
-                        "Calibri", "Arial", "Times New Roman", "Cambria", "Helvetica", "Verdana",
-                        "Courier New", "Segoe UI", "Tahoma", "Symbol"}
+                    safe_font = local(node.tag) == "name" and attr == "val" and value in SAFE_FONTS
                     if value and not technical and not safe_font:
                         fields.append(value)
         return list(dict.fromkeys(fields))

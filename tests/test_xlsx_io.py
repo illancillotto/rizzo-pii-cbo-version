@@ -360,6 +360,9 @@ class XlsxFlow(unittest.TestCase):
         restored = load_workbook(io.BytesIO(restore(job.output, job.dictionary)))
         self.assertEqual(restored.active["A1"].comment.text, EMAIL)
         self.assertEqual(restored.active.oddHeader.center.text, EMAIL)
+        book.active.oddHeader.center.font = NAME
+        with self.assertRaisesRegex(XlsxError, "Font"):
+            WorkbookJob(save(book))
 
     def test_typed_metadata_uses_valid_neutral_value_and_restores(self):
         from xlsx_io import NEUTRAL
