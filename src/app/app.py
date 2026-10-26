@@ -387,6 +387,40 @@ def _norm(s):
     return re.sub(r"\s+", " ", s.strip()).casefold()
 
 
+def recognize_batch(texts, check_budget=lambda: None):
+    """XLSX adapter: the same local model, regex and merge as text/PDF.
+
+    Samples are never concatenated. Flatten only model chunks for bounded
+    inference batches, then merge candidates separately for each source cell.
+    Placeholder generation belongs to the workbook's PiiSession.
+    """
+    candidates = [[] for _ in texts]
+    chunks = [(index, value, offset) for index, text in enumerate(texts)
+              for value, offset in chunk_text(text)]
+    for start in range(0, len(chunks), 8):
+        check_budget()
+        batch = chunks[start:start + 8]
+        results = nlp([value for _, value, _ in batch], batch_size=8)
+        for (index, _, offset), entities in zip(batch, results):
+            for entity in entities:
+                candidates[index].append({
+                    "label": entity["entity_group"], "start": int(entity["start"]) + offset,
+                    "end": int(entity["end"]) + offset, "score": float(entity["score"]),
+                    "validated": False, "source": "modello"})
+    merged = []
+    for text, entities in zip(texts, candidates):
+        check_budget()
+        complete_time(entities, text)
+        # Existing XLSX placeholders are opaque input, not entity fragments.
+        from xlsx_io import PLACEHOLDER
+        opaque = [m.span() for m in PLACEHOLDER.finditer(text)]
+        combined = entities + detect_regex(text)
+        combined = [e for e in combined if not any(e["start"] < end and start < e["end"]
+                                                  for start, end in opaque)]
+        merged.append(_merge(combined, text))
+    return merged
+
+
 def analyze(text, excluded=None, mapping_enabled=True):
     """excluded = tag da NON anonimizzare: le entita' di quel tipo vengono scartate
     prima della fusione, quindi il valore resta in chiaro nel testo di output.
