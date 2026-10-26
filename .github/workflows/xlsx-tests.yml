@@ -1,0 +1,51 @@
+name: xlsx tests
+
+on:
+  push:
+    paths:
+      - 'src/app/**'
+      - 'tests/test_xlsx*.py'
+      - 'requirements-xlsx-test.txt'
+      - 'scripts/check_xlsx*.py'
+      - '.github/workflows/xlsx-tests.yml'
+  pull_request:
+    paths:
+      - 'src/app/**'
+      - 'tests/test_xlsx*.py'
+      - 'requirements-xlsx-test.txt'
+      - 'scripts/check_xlsx*.py'
+      - '.github/workflows/xlsx-tests.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xlsx-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  xlsx:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -r requirements-xlsx-test.txt
+      - name: XLSX and API tests (no ML dependencies)
+        run: |
+          python -c "import flask, openpyxl, defusedxml"
+          python -m unittest discover -v -s tests -p 'test_xlsx*.py'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Existing text restore regression and Excel script syntax
+        run: |
+          python tests/test_ripristino_placeholder.py
+          python -c "from pathlib import Path; s=Path('src/app/xlsx_ui.html').read_text(); Path('/tmp/xlsx-ui.js').write_text(s.split('<script>')[1].split('</script>')[0])"
+          node --check /tmp/xlsx-ui.js
+

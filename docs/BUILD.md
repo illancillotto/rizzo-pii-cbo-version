@@ -187,11 +187,26 @@ Note specifiche di macOS:
 ## Passi
 
 ### 1. Ambiente CPU (una volta)
+
+Il supporto Excel richiede `openpyxl>=3.1.5,<4` e `defusedxml>=0.7.1,<1` anche
+nei venv di build già esistenti. Entrambi gli spec raccolgono queste librerie e
+includono `src/app/xlsx_ui.html`; gli script Linux/macOS, il Docker builder e il
+workflow Windows installano le nuove dipendenze. `build_mac.sh` controlla che
+siano presenti nel venv fornito. Non cambiano versione dell'app o tag di release.
+
+Prima di distribuire un nuovo installer eseguire i test di
+[XLSX.md](XLSX.md) e verificare upload/export/ripristino nell'installer costruito.
+L'aggiornamento dei file di packaging non equivale a un installer verificato:
+consultare [XLSX_VERIFICATION.md](XLSX_VERIFICATION.md) per le build effettivamente
+provate. Per il server Docker mantenere un worker Gunicorn: le sessioni XLSX
+sono in memoria nel processo. Le nuove variabili `PII_XLSX_*` possono essere
+passate nel servizio Compose senza modificare il volume delle preferenze.
+
 ```powershell
 python -m venv build_env
 build_env\Scripts\python.exe -m pip install --upgrade pip
 build_env\Scripts\python.exe -m pip install --index-url https://download.pytorch.org/whl/cpu torch
-build_env\Scripts\python.exe -m pip install "transformers==4.57.3" tokenizers safetensors flask pymupdf pyinstaller
+build_env\Scripts\python.exe -m pip install "transformers==4.57.3" tokenizers safetensors flask pymupdf "openpyxl>=3.1.5,<4" "defusedxml>=0.7.1,<1" pyinstaller
 ```
 
 ### 2. Build dell'eseguibile

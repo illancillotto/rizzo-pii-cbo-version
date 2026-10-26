@@ -37,7 +37,7 @@ if [ ! -d "$VENV" ]; then
   python3 -m venv "$VENV"
   "$VENV/bin/pip" install --upgrade pip
   "$VENV/bin/pip" install --index-url https://download.pytorch.org/whl/cpu torch
-  "$VENV/bin/pip" install "transformers==4.57.3" tokenizers safetensors flask pymupdf pyinstaller
+  "$VENV/bin/pip" install "transformers==4.57.3" tokenizers safetensors flask pymupdf "openpyxl>=3.1.5,<4" "defusedxml>=0.7.1,<1" pyinstaller
 fi
 
 # ---- 2) sidecar PyInstaller -> tauri/src-tauri/backend/pii-backend/pii-backend ----

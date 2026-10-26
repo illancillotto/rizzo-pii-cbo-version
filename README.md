@@ -375,6 +375,30 @@ python src/app/app.py                                 # -> http://127.0.0.1:5005
 python src/app/app.py --port 8080 --exclude-tags AGE,GENDER --no-mapping   # same knobs as above
 ```
 
+### Native Excel .xlsx support
+
+The **Excel .xlsx** link in the local app opens `/xlsx`: upload a workbook,
+select sheets and mandatory columns (including numeric identifiers), review
+paginated proposals, and download a verified pseudonymized workbook. Download
+the optional reversible dictionary **separately**; upload both original downloads
+in the Excel restore section to recover supported values and types.
+
+Processing uses the existing local model and regex/checksum engine. No document
+content is sent to a cloud service. Mandatory columns override category exclusions;
+headers, hidden sheets, comments and metadata are inspected too. Automatic
+detection can miss PII: review remains necessary.
+
+This first version accepts a conservative subset of unencrypted `.xlsx` files.
+Macros, images, embedded objects, pivots, external links/hyperlinks, custom themes
+and other unsupported components are rejected. Only a small formula subset is
+preserved, cached results are cleared, and export is blocked if a formula depends
+on masked cells. Workbooks saved again by Excel/LibreOffice no longer match the
+original dictionary's SHA-256; retain the unmodified exported file for restoration.
+
+See the [Excel guide, limits and API](docs/XLSX.md) and the
+[verification report](docs/XLSX_VERIFICATION.md). This feature does not claim full
+Excel fidelity or guarantee that no personal data remains.
+
 ### One document, from the CLI
 
 No server at all: entities and anonymized text printed to stdout.

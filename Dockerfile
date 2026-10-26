@@ -35,7 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # (NB: transformers 5.x qui, mentre Dockerfile.linux resta sul 4.57.3 di PyInstaller.)
 RUN pip install --upgrade pip \
  && pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.13.0" \
- && pip install "transformers==5.14.1" tokenizers safetensors flask pymupdf gunicorn huggingface_hub
+ && pip install "transformers==5.14.1" tokenizers safetensors flask pymupdf "openpyxl>=3.1.5,<4" "defusedxml>=0.7.1,<1" gunicorn huggingface_hub
 
 # --- modello -----------------------------------------------------------------
 # app.py con APP_MODEL_VERSION="1.5.0" cerca models/rizzo-pii-0.3B-v1.5.0/ a partire

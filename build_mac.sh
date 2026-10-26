@@ -41,6 +41,8 @@ DMG_OUT="$ROOT/tauri/src-tauri/target/release/bundle/dmg/Rizzo-PII-2.0.0-macOS-a
 command -v cargo >/dev/null || { echo "ERRORE: Rust/cargo non trovato"; exit 1; }
 command -v npm   >/dev/null || { echo "ERRORE: npm non trovato"; exit 1; }
 
+"$VENV/bin/python" -c "import openpyxl, defusedxml" || { echo "Installare openpyxl e defusedxml nel venv di build"; exit 1; }
+
 # ---- 1) sidecar PyInstaller ------------------------------------------------
 "$VENV/bin/pyinstaller" build_sidecar.spec --noconfirm \
   --distpath tauri/src-tauri/backend --workpath build/sidecar_work_mac

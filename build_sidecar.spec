@@ -7,7 +7,7 @@
 from PyInstaller.utils.hooks import collect_all
 
 datas, binaries, hiddenimports = [], [], []
-for pkg in ("transformers", "tokenizers", "safetensors", "huggingface_hub", "regex"):
+for pkg in ("transformers", "tokenizers", "safetensors", "huggingface_hub", "regex", "openpyxl", "defusedxml"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
@@ -15,6 +15,7 @@ for pkg in ("transformers", "tokenizers", "safetensors", "huggingface_hub", "reg
 
 # modello + asset grafici impacchettati (app.py li risolve via _resource_path / _MEIPASS)
 datas += [("models/rizzo-pii-0.3B-v1.5.0", "pii_model")]
+datas += [("src/app/xlsx_ui.html", ".")]
 datas += [("src/app/assets", "assets")]
 hiddenimports += ["fitz", "flask", "sklearn.utils._typedefs"]
 

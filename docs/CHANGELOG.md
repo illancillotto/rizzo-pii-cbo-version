@@ -5,6 +5,23 @@ Le voci più recenti in alto. (Codice: `src/training/train_pii.py` salvo diverso
 
 ---
 
+## 2026-10-26 — Supporto nativo XLSX locale
+
+Nuova pagina `/xlsx` con caricamento, configurazione di fogli/intestazioni/colonne
+obbligatorie, inferenza locale in batch, revisione paginata e download separati di
+cartella pseudonimizzata e dizionario versionato. Ripristino dei valori e tipi
+supportati con verifica SHA-256 del file esportato. Sessioni isolate, scadenza e
+documenti soltanto in memoria, senza spool multipart sul filesystem.
+
+Preflight OOXML conservativo e limiti su ZIP/XML/celle/budget; parti non gestibili
+rifiutate. Formule limitate senza valutazione, cache svuotate, dipendenze da celle
+mascherate bloccate. Export subordinato a riapertura indipendente, invarianti e
+controllo residui. Nessuna modifica alle API testo/PDF esistenti.
+
+Dipendenze openpyxl/defusedxml incluse in runtime, Docker e packaging. Job CI
+XLSX leggero realmente eseguito senza torch. Dettagli, restrizioni e risultati
+in [XLSX.md](XLSX.md) e [XLSX_VERIFICATION.md](XLSX_VERIFICATION.md).
+
 ## 2026-10-22 — Il PDF protetto da password si riconosce già al caricamento (`app.py`)
 
 Completa la voce del 2026-09-25: lì il server rispondeva già col messaggio chiaro, ma
