@@ -504,6 +504,11 @@ def index():
     return _page()
 
 
+from xlsx_api import register_xlsx  # noqa: E402
+
+register_xlsx(app, recognize_batch, _get_prefs)
+
+
 @app.route("/assets/<path:fn>")
 def assets(fn):
     if os.path.isfile(os.path.join(ASSETS_DIR, fn)):
@@ -1230,6 +1235,7 @@ PAGE = r"""
   </header>
 
   <div class="tabs">
+    <a class="tab" href="/xlsx" style="text-decoration:none;color:inherit">Excel .xlsx</a>
     <div class="tab on" id="tab1" onclick="showTab(1)">
       <span class="num">1</span> <span data-i18n="tab1">Anonimizza</span> <span class="arrow">→</span>
     </div>

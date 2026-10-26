@@ -15,6 +15,7 @@ import posixpath
 import re
 import time
 import zipfile
+from collections import deque
 from dataclasses import dataclass
 from xml.etree import ElementTree as ET
 
@@ -22,6 +23,7 @@ from defusedxml.ElementTree import fromstring
 from openpyxl import load_workbook
 from openpyxl.formula.tokenizer import Tokenizer, TokenizerError
 from openpyxl.utils.cell import range_boundaries
+from openpyxl.writer.theme import theme_xml
 
 from pii_session import PiiSession
 
@@ -106,6 +108,7 @@ SHEET_TAGS = set("worksheet sheetPr tabColor outlinePr pageSetUpPr dimension she
                  "ignoredError sheetProtection".split())
 CELL_REF = re.compile(r"\$?[A-Z]{1,3}\$?[1-9][0-9]*(?::\$?[A-Z]{1,3}\$?[1-9][0-9]*)?")
 PLACEHOLDER = re.compile(r"\[\[RZ_[a-f0-9]{16}_[A-Z][A-Z0-9_]{0,31}_[1-9][0-9]*\]\]")
+NEUTRAL = {"metadata_date": "2000-01-01T00:00:00Z", "metadata_number": "0", "metadata_bool": "false"}
 
 
 def local(tag):
@@ -124,6 +127,48 @@ def contains_value(field, value):
     # Avoid identifying numeric 1 inside cell coordinate A1 or color 1F497D.
     # Exact single-character values are still checked in real data fields.
     return bool(re.search(r"(?<!\w)" + re.escape(value) + r"(?!\w)", PLACEHOLDER.sub(" ", field)))
+
+
+class ValueScanner:
+    """Aho-Corasick index: avoid values × fields quadratic residual scans."""
+    def __init__(self, values, budget):
+        self.next, self.fail, self.ends = [{}], [0], [[]]
+        self.budget = budget
+        for number, value in enumerate(values):
+            if number % 256 == 0:
+                budget()
+            state = 0
+            for char in value:
+                if char not in self.next[state]:
+                    self.next[state][char] = len(self.next)
+                    self.next.append({}); self.fail.append(0); self.ends.append([])
+                state = self.next[state][char]
+            self.ends[state].append(value)
+        queue = deque(self.next[0].values())
+        while queue:
+            state = queue.popleft()
+            for char, child in self.next[state].items():
+                queue.append(child)
+                fallback = self.fail[state]
+                while fallback and char not in self.next[fallback]:
+                    fallback = self.fail[fallback]
+                self.fail[child] = self.next[fallback].get(char, 0)
+                self.ends[child].extend(self.ends[self.fail[child]])
+
+    def find(self, field):
+        field = PLACEHOLDER.sub(" ", field)
+        state = 0
+        for index, char in enumerate(field):
+            if index % 4096 == 0:
+                self.budget()
+            while state and char not in self.next[state]:
+                state = self.fail[state]
+            state = self.next[state].get(char, 0)
+            for value in self.ends[state]:
+                start, end = index - len(value) + 1, index + 1
+                if ((start == 0 or not (field[start - 1].isalnum() or field[start - 1] == "_")) and
+                        (end == len(field) or not (field[end].isalnum() or field[end] == "_"))):
+                    yield value
 
 
 def parse_xml(data):
@@ -240,6 +285,11 @@ class Package:
                 if any((n.text or "").strip() for n in root.iter()
                        if local(n.tag) not in {"Anchor", "Row", "Column", "AutoFill"}):
                     raise XlsxError("Testo non ispezionabile in disegni VML.")
+            if part.startswith("xl/theme/"):
+                # The first version accepts the audited Office theme shipped by
+                # openpyxl. Arbitrary themes can contain text/drawings/extensions.
+                if xml_bytes(root) != xml_bytes(parse_xml(theme_xml.encode())):
+                    raise XlsxError("Tema Excel personalizzato non supportato: usare il tema Office standard.")
 
     @staticmethod
     def target(rels_part, target):
@@ -283,6 +333,8 @@ class Package:
     def _slot(self, part, node, value, kind="text", **meta):
         if len(value) > self.limits.cell_length:
             raise XlsxError("Superata la lunghezza massima di una cella.")
+        if re.search(r"_x[0-9a-fA-F]{4}_", value):
+            raise XlsxError("Sequenze di escape OOXML nei dati non supportate: salvare una copia con testo semplice.")
         slot = {"id": len(self.slots), "part": part, "node": node, "value": value,
                 "kind": kind, **meta}
         self.slots.append(slot)
@@ -375,7 +427,16 @@ class Package:
             if part.startswith("docProps/") or re.fullmatch(r"xl/(?:comments[0-9]+|comments/comment[0-9]+)\.xml", part):
                 for node in root.iter():
                     if node.text and node.text.strip():
-                        self._slot(part, node, node.text, field=local(node.tag))
+                        tag = local(node.tag)
+                        kind = "text"
+                        if part.startswith("docProps/"):
+                            if tag in {"created", "modified", "lastPrinted", "filetime"}:
+                                kind = "metadata_date"
+                            elif tag in {"i2", "i4", "i8", "int", "ui1", "ui2", "ui4", "ui8", "uint", "r4", "r8", "decimal"}:
+                                kind = "metadata_number"
+                            elif tag == "bool":
+                                kind = "metadata_bool"
+                        self._slot(part, node, node.text, kind=kind, field=tag)
             if part == "xl/styles.xml":
                 # Textual style metadata must be inspected too (custom number formats,
                 # font names and named styles). Changing their semantics is unsafe.
@@ -412,6 +473,8 @@ class Package:
             else:
                 covered_text.add(id(node))
         for part, root in self.roots.items():
+            if part.startswith("xl/theme/"):
+                continue  # exact, preflight-verified technical boilerplate
             for node in root.iter():
                 if id(node) not in covered_text and (node.text or "").strip():
                     fields.append(node.text)
@@ -422,7 +485,13 @@ class Package:
                         continue
                     if part.endswith(".rels") or part == "[Content_Types].xml":
                         continue
-                    if value and not value.isdigit():
+                    technical = (re.fullmatch(r"[+-]?[0-9]+(?:\.[0-9]+)?", value) or
+                                 CELL_REF.fullmatch(value) or re.fullmatch(r"rId[0-9]+", value) or
+                                 (attr in {"rgb", "val"} and re.fullmatch(r"[A-Fa-f0-9]{6,8}", value)))
+                    safe_font = local(node.tag) == "name" and attr == "val" and value in {
+                        "Calibri", "Arial", "Times New Roman", "Cambria", "Helvetica", "Verdana",
+                        "Courier New", "Segoe UI", "Tahoma", "Symbol"}
+                    if value and not technical and not safe_font:
                         fields.append(value)
         return list(dict.fromkeys(fields))
 
@@ -468,6 +537,7 @@ class WorkbookJob:
         self.output = None
         self.dictionary = None
         self.analysed = False
+        self.progress = {"phase": "uploaded", "completed": 0, "total": len(self.package.slots)}
 
     def summary(self):
         return {"sheets": self.package.sheets, "cells": len(self.package.cells),
@@ -480,6 +550,7 @@ class WorkbookJob:
         self.output = self.dictionary = None
         self.analysed = False
         self.changes = []
+        self.progress = {"phase": "analysis", "completed": 0, "total": len(p.slots)}
         if not isinstance(config, dict):
             raise XlsxError("Configurazione XLSX non valida.")
         mapping = config.get("include_mapping", True)
@@ -558,13 +629,16 @@ class WorkbookJob:
                            for c in self.changes):
                         continue
                     ph = self.session.placeholder(category, slot["value"][start:end], slot["kind"])
+                    ph = NEUTRAL.get(slot["kind"], ph)
                     self.changes.append({"id": len(self.changes), "slot": slot["id"],
                                          "start": start, "end": end, "category": category,
                                          "replacement": ph, "enabled": True,
                                          "forced": bool(entity.get("forced")),
                                          "conflict": bool(entity.get("forced") and category in self.excluded)})
+            self.progress = {"phase": "analysis", "completed": min(offset + 16, len(slots)), "total": len(slots)}
         p.check_time()
         self.analysed = True
+        self.progress["phase"] = "review"
         return {"changes": len(self.changes), "mapping_enabled": mapping,
                 "forced_precedence": True, "complete": True}
 
@@ -603,6 +677,7 @@ class WorkbookJob:
             slot = self.package.slots[change["slot"]]
             try:
                 ph = self.session.placeholder(edit["category"], slot["value"][change["start"]:change["end"]], slot["kind"])
+                ph = NEUTRAL.get(slot["kind"], ph)
             except ValueError:
                 raise XlsxError("Categoria non valida.") from None
             for target in targets:
@@ -632,6 +707,7 @@ class WorkbookJob:
         category = edit.get("category", "ID")
         try:
             ph = self.session.placeholder(category, slot["value"][start:end], slot["kind"])
+            ph = NEUTRAL.get(slot["kind"], ph)
         except ValueError:
             raise XlsxError("Categoria non valida.") from None
         self.changes.append({"id": len(self.changes), "slot": slot_id, "start": start, "end": end,
@@ -668,6 +744,8 @@ class WorkbookJob:
         if not self.analysed:
             raise XlsxError("Analizzare prima il documento.")
         p = self.package
+        self.output = self.dictionary = None
+        self.progress = {"phase": "verification", "completed": 0, "total": len(p.slots)}
         p.deadline = time.monotonic() + p.limits.seconds
         # Always export from the analysed source, so repeated exports and review
         # changes cannot compound substitutions.
@@ -705,9 +783,11 @@ class WorkbookJob:
         p.check_time()
         verified = Package(data, limits=p.limits)
         self._verify_structure(data, p, verified)
-        if any((contains_value(field, value) if kind == "text" else field == value)
-               for value, kind in known_values for field in verified.static_fields):
-            raise XlsxError("Verifica residui fallita nei nomi, stili o metadati non modificabili.")
+        scanner = ValueScanner({v for v, k in known_values if k == "text"}, p.check_time)
+        typed_values = {v for v, k in known_values if k != "text"}
+        for field in verified.static_fields:
+            if field in typed_values or next(scanner.find(field), None) is not None:
+                raise XlsxError("Verifica residui fallita nei nomi, stili o metadati non modificabili.")
         # Scan every accepted XML scalar, including metadata, relations and caches.
         # Review exclusions authorize only the exact reviewed field/occurrence.
         authorised = {}
@@ -719,27 +799,33 @@ class WorkbookJob:
             value = slot["value"]
             source_slot = p.slots[slot["id"]] if slot["id"] < len(p.slots) else None
             allowed = authorised.get(slot["id"], set())
-            for original, kind in known_values:
-                if (contains_value(value, original) if kind == "text" else value == original) and original not in allowed:
+            for original in scanner.find(value):
+                if original not in allowed:
                     raise XlsxError("Verifica residui fallita: un valore sostituito è ancora presente.")
+            if value in typed_values and value not in allowed:
+                raise XlsxError("Verifica residui fallita: un identificativo tipizzato è ancora presente.")
             if source_slot is None:
                 raise XlsxError("Campi del documento non coerenti dopo l'esportazione.")
         # Run the same detector again on output text, removing our placeholders.
         for offset in range(0, len(verified.slots), 16):
             p.check_time()
             batch = verified.slots[offset:offset + 16]
-            clean = [PLACEHOLDER.sub(" ", s["value"]) for s in batch]
+            clean = ["" if s["kind"] in NEUTRAL and s["value"] == NEUTRAL[s["kind"]]
+                     else PLACEHOLDER.sub(" ", s["value"]) for s in batch]
             results = detect_batch(clean)
             for slot, value, entities in zip(batch, clean, results):
                 for entity in entities:
                     original = value[entity["start"]:entity["end"]]
                     if entity["label"] not in self.excluded and original not in authorised.get(slot["id"], set()):
                         raise XlsxError("Verifica residui fallita: rivedere le sostituzioni prima del download.")
+            self.progress = {"phase": "verification", "completed": min(offset + 16, len(verified.slots)),
+                             "total": len(verified.slots)}
         self.output = data
         if self.session.mapping_enabled:
             self.dictionary = {"format": "rizzo-pii-xlsx", "version": 1,
                                "sha256": hashlib.sha256(data).hexdigest(),
                                "namespace": self.session.namespace, "edits": restoration}
+        self.progress["phase"] = "ready"
         return data
 
     @staticmethod
@@ -759,7 +845,7 @@ def restore(data, dictionary, limits=None):
     limits = limits or Limits.environment()
     if not isinstance(dictionary, dict) or set(dictionary) != {"format", "version", "sha256", "namespace", "edits"}:
         raise XlsxError("Formato del dizionario XLSX non valido.")
-    if (dictionary["format"] != "rizzo-pii-xlsx" or dictionary["version"] != 1 or
+    if (dictionary["format"] != "rizzo-pii-xlsx" or type(dictionary["version"]) is not int or dictionary["version"] != 1 or
             not isinstance(dictionary["namespace"], str) or not re.fullmatch(r"[a-f0-9]{16}", dictionary["namespace"]) or
             dictionary["sha256"] != hashlib.sha256(data).hexdigest()):
         raise XlsxError("Dizionario errato o file modificato/rielaborato: SHA-256 non corrispondente.")
@@ -777,13 +863,21 @@ def restore(data, dictionary, limits=None):
         seen.add(slot_id)
         slot = package.slots[slot_id]
         if (not isinstance(edit["original"], str) or len(edit["original"]) > limits.cell_length or
-                edit["expected"] != slot["value"] or edit["kind"] not in {"text", "n", "b", "d", "e"} or
+                not isinstance(edit["kind"], str) or
+                (edit["cell_type"] is not None and not isinstance(edit["cell_type"], str)) or
+                edit["expected"] != slot["value"] or edit["kind"] not in {"text", "n", "b", "d", "e", *NEUTRAL} or
                 edit["cell_type"] not in {None, "n", "b", "d", "e", "str", "inlineStr"}):
             raise XlsxError("Valore o tipo di ripristino non valido.")
         matches = PLACEHOLDER.findall(edit["expected"])
-        if not matches or any("RZ_" + dictionary["namespace"] + "_" not in ph for ph in matches):
+        neutral = edit["kind"] in NEUTRAL and slot["kind"] == edit["kind"] and edit["expected"] == NEUTRAL[edit["kind"]]
+        added = set(matches) - set(PLACEHOLDER.findall(edit["original"]))
+        if not neutral and (not added or any("RZ_" + dictionary["namespace"] + "_" not in ph for ph in added)):
             raise XlsxError("Placeholder sconosciuto o non coerente con il dizionario.")
         WorkbookJob.set_value(slot, edit["original"], edit["kind"], edit["cell_type"])
+    own_marker = "[[RZ_" + dictionary["namespace"] + "_"
+    for slot in package.slots:
+        if own_marker in slot["value"] and slot["id"] not in seen:
+            raise XlsxError("Dizionario incompleto: placeholder privi di una voce di ripristino.")
     result = package.serialize()
     checked = Package(result, limits=limits)
     WorkbookJob._verify_structure(result, package, checked)
