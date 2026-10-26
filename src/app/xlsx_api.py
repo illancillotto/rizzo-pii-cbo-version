@@ -32,7 +32,8 @@ class Store:
             for identifier, entry in list(self.entries.items()):
                 if self.now() - entry["created"] > self.ttl:
                     entry["cancelled"] = True
-                    self.entries.pop(identifier, None)
+                    if entry["state"] not in {"analysing", "exporting"}:
+                        self.entries.pop(identifier, None)
 
     def add(self, job, owner):
         self.purge()
@@ -44,7 +45,7 @@ class Store:
             if len(self.entries) >= self.maximum or sum(e["cost"] for e in self.entries.values()) + cost > self.memory:
                 raise XlsxError("Archivio temporaneo pieno: eliminare documenti o attendere la scadenza.")
             identifier = secrets.token_urlsafe(32)
-            entry = {"job": job, "owner": owner, "created": self.now(), "cost": cost,
+            entry = {"id": identifier, "job": job, "owner": owner, "created": self.now(), "cost": cost,
                      "state": "uploaded", "error": None, "cancelled": False}
             self.entries[identifier] = entry
             return identifier, entry
@@ -53,7 +54,7 @@ class Store:
         self.purge()
         with self.lock:
             entry = self.entries.get(identifier)
-            if entry is None or not owner or not hmac.compare_digest(entry["owner"], owner):
+            if entry is None or entry["cancelled"] or not owner or not hmac.compare_digest(entry["owner"], owner):
                 return None
             return entry
 
@@ -62,7 +63,8 @@ class Store:
             entry = self.get(identifier, owner)
             if entry is not None:
                 entry["cancelled"] = True
-                self.entries.pop(identifier, None)
+                if entry["state"] not in {"analysing", "exporting"}:
+                    self.entries.pop(identifier, None)
                 return True
             return False
 
@@ -79,6 +81,22 @@ def register_xlsx(app, recognize_batch, preferences=lambda: ([], True), store=No
     ingest = threading.BoundedSemaphore(1)
     bp.store = store
     bp.executor = pool
+
+    class MemoryUpload(io.BytesIO):
+        def write(self, data):
+            if self.tell() + len(data) > max(limits.compressed, limits.characters * 8 + 1024):
+                raise RequestEntityTooLarge()
+            return super().write(data)
+
+    class LocalXlsxRequest(app.request_class):
+        def _get_file_stream(self, total_content_length, content_type, filename=None, content_length=None):
+            # Werkzeug otherwise spools uploads >500 KiB to a temporary disk file.
+            # Keep existing PDF/text request behavior unchanged.
+            if self.path.startswith("/api/xlsx/"):
+                return MemoryUpload()
+            return super()._get_file_stream(total_content_length, content_type, filename, content_length)
+
+    app.request_class = LocalXlsxRequest
 
     if start_sweeper:
         def sweep():
@@ -103,6 +121,9 @@ def register_xlsx(app, recognize_batch, preferences=lambda: ([], True), store=No
                 return jsonify(error="Richiesta da un altro sito non consentita."), 403
             if request.method in {"POST", "PATCH", "DELETE"} and request.headers.get("X-Rizzo-XLSX") != "1":
                 return jsonify(error="Header di protezione XLSX mancante."), 403
+            if (request.method in {"POST", "PATCH"} and not request.path.endswith(("/upload", "/restore"))
+                    and request.content_length is not None and request.content_length > 1024 * 1024):
+                return jsonify(error="Configurazione o revisione XLSX troppo grande."), 413
 
     @bp.after_request
     def private(response):
@@ -168,6 +189,10 @@ def register_xlsx(app, recognize_batch, preferences=lambda: ([], True), store=No
                 with store.lock:
                     entry.update(state="review" if entry["job"].analysed else "uploaded", error=message)
                     entry["job"].output = entry["job"].dictionary = None
+            finally:
+                with store.lock:
+                    if entry["cancelled"]:
+                        store.entries.pop(entry["id"], None)
         pool.submit(run)
 
     @bp.get("/xlsx")
@@ -247,6 +272,19 @@ def register_xlsx(app, recognize_batch, preferences=lambda: ([], True), store=No
             entry["job"].correct(request.get_json())
             entry.update(state="review", error=None)
             return jsonify(ok=True)
+
+    @bp.get("/api/xlsx/<identifier>/fields")
+    def fields(identifier):
+        with store.lock:
+            entry, error = entry_for(identifier, idle=True)
+            if error:
+                return error
+            try:
+                page = int(request.args.get("page", "0"))
+                size = int(request.args.get("size", "25"))
+            except ValueError:
+                raise XlsxError("Numero di pagina non valido.") from None
+            return jsonify(entry["job"].fields(page, size, request.args.get("scope", "metadata")))
 
     @bp.post("/api/xlsx/<identifier>/review")
     def add(identifier):

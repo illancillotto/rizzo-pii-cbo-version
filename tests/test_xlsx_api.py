@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src/app"))
 try:
-    from flask import Flask
+    from flask import Flask, request
     from xlsx_api import Store, register_xlsx
     from test_xlsx_io import EMAIL, NAME, fake_batch, load_workbook, save, workbook
     AVAILABLE = True
@@ -136,6 +136,9 @@ class XlsxApi(unittest.TestCase):
         self.analyze(url, {"include_mapping": False})
         preview = self.client.get(url + "/preview")
         self.assertNotIn(EMAIL.encode(), preview.data)
+        fields = self.client.get(url + "/fields?scope=all")
+        self.assertNotIn(EMAIL.encode(), fields.data)
+        self.assertNotIn(b'"value"', fields.data)
         self.export(url)
         self.assertEqual(self.client.get(url + "/mapping").status_code, 403)
         self.assertEqual(self.client.get(url + "/download").status_code, 200)
@@ -173,8 +176,21 @@ class XlsxApi(unittest.TestCase):
         url = self.upload(); self.analyze(url)
         for query in ["page=no", "page=-1", "size=999"]:
             self.assertEqual(self.client.get(url + "/preview?" + query).status_code, 422)
+            self.assertEqual(self.client.get(url + "/fields?" + query).status_code, 422)
         self.assertEqual(self.client.patch(url + "/review", headers=HEADERS,
                                           data="{bad", content_type="application/json").status_code, 400)
+
+    def test_metadata_inventory_add_and_pagination(self):
+        book = workbook(); book.properties.description = "record-metadata-82"
+        url = self.upload(book); self.analyze(url)
+        fields = self.client.get(url + "/fields?scope=metadata&size=100")
+        self.assertEqual(fields.status_code, 200)
+        field = next(f for f in fields.json["items"] if f["field"] == "description")
+        self.assertEqual(self.client.post(url + "/review", headers=HEADERS,
+                                         json={"slot": field["slot"], "category": "META"}).status_code, 201)
+        self.export(url)
+        output = load_workbook(io.BytesIO(self.client.get(url + "/download").data))
+        self.assertNotEqual(output.properties.description, "record-metadata-82")
 
     def test_restore_duplicate_json_keys_and_wrong_dictionary(self):
         url = self.upload(); self.analyze(url); self.export(url)
@@ -192,6 +208,14 @@ class XlsxApi(unittest.TestCase):
         cookie = response.headers["Set-Cookie"]
         self.assertIn("HttpOnly", cookie)
         self.assertIn("SameSite=Strict", cookie)
+
+    def test_upload_parser_never_spools_xlsx_documents_to_disk(self):
+        body = (b'--synthetic-boundary\r\nContent-Disposition: form-data; name="file"; '
+                b'filename="synthetic.xlsx"\r\nContent-Type: application/octet-stream\r\n\r\n' +
+                b"synthetic" * 80000 + b'\r\n--synthetic-boundary--\r\n')
+        with self.app.test_request_context("/api/xlsx/upload", method="POST",
+             data=body, content_type="multipart/form-data; boundary=synthetic-boundary"):
+            self.assertIsInstance(request.files["file"].stream, io.BytesIO)
 
     def test_concurrent_operations_rejected_and_delete_cancels(self):
         # Hold a real background worker at a deterministic batch boundary.

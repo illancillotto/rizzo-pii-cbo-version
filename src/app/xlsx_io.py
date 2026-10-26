@@ -19,13 +19,14 @@ from collections import deque
 from dataclasses import dataclass
 from xml.etree import ElementTree as ET
 
-from defusedxml.ElementTree import fromstring
+from defusedxml.ElementTree import DefusedXMLParser
 from openpyxl import load_workbook
 from openpyxl.formula.tokenizer import Tokenizer, TokenizerError
 from openpyxl.utils.cell import range_boundaries
 from openpyxl.writer.theme import theme_xml
 
 from pii_session import PiiSession
+from detectors import detect_regex
 
 MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 REL = "http://schemas.openxmlformats.org/package/2006/relationships"
@@ -49,6 +50,8 @@ class Limits:
     cells: int = 50000
     cell_length: int = 32767
     characters: int = 2000000
+    scan_nodes: int = 200000
+    xml_nodes: int = 200000
     seconds: int = 120
 
     @classmethod
@@ -106,9 +109,32 @@ SHEET_TAGS = set("worksheet sheetPr tabColor outlinePr pageSetUpPr dimension she
                  "pageMargins pageSetup headerFooter oddHeader oddFooter evenHeader evenFooter "
                  "firstHeader firstFooter rowBreaks colBreaks brk legacyDrawing ignoredErrors "
                  "ignoredError sheetProtection".split())
+WORKBOOK_TAGS = set("workbook fileVersion workbookPr workbookProtection bookViews workbookView "
+                    "sheets sheet definedNames definedName calcPr".split())
+STYLE_TAGS = set("styleSheet numFmts numFmt fonts font name charset family b i strike outline shadow "
+                 "condense extend color sz u vertAlign scheme fills fill patternFill fgColor bgColor "
+                 "gradientFill stop borders border left right top bottom diagonal vertical horizontal "
+                 "start end cellStyleXfs cellXfs xf alignment protection cellStyles cellStyle dxfs dxf "
+                 "tableStyles tableStyle tableStyleElement colors indexedColors rgbColor mruColors".split())
+CORE_TAGS = set("coreProperties creator title description subject identifier language created modified "
+                "lastModifiedBy category contentStatus version revision keywords lastPrinted".split())
+APP_TAGS = set("Properties Template Manager Company Pages Words Characters PresentationFormat Lines "
+               "Paragraphs Slides Notes TotalTime HiddenSlides MMClips ScaleCrop HeadingPairs TitlesOfParts "
+               "LinksUpToDate CharactersWithSpaces SharedDoc HyperlinksChanged Application AppVersion "
+               "DocSecurity vector variant lpstr lpwstr i2 i4 i8 int ui1 ui2 ui4 ui8 uint r4 r8 decimal bool filetime".split())
+COMMENT_TAGS = set("comments authors author commentList comment text r t rPr b i u strike outline shadow "
+                   "condense extend sz color rFont family charset scheme vertAlign".split())
 CELL_REF = re.compile(r"\$?[A-Z]{1,3}\$?[1-9][0-9]*(?::\$?[A-Z]{1,3}\$?[1-9][0-9]*)?")
 PLACEHOLDER = re.compile(r"\[\[RZ_[a-f0-9]{16}_[A-Z][A-Z0-9_]{0,31}_[1-9][0-9]*\]\]")
 NEUTRAL = {"metadata_date": "2000-01-01T00:00:00Z", "metadata_number": "0", "metadata_bool": "false"}
+HEADER_CODE = re.compile(r'&(?:"[^"\n]{0,512}"|K[0-9A-Fa-f]{6}|[0-9]{1,3}|[LCRPNDTAFZBIUESXY])')
+
+
+def detector_text(slot):
+    value = slot["value"]
+    if slot.get("field") in {"oddHeader", "oddFooter", "evenHeader", "evenFooter", "firstHeader", "firstFooter"}:
+        value = HEADER_CODE.sub(lambda m: " " * len(m.group()), value)
+    return value
 
 
 def local(tag):
@@ -123,15 +149,23 @@ def xml_bytes(node):
     return ET.tostring(node, encoding="utf-8", xml_declaration=True)
 
 
-def contains_value(field, value):
-    # Avoid identifying numeric 1 inside cell coordinate A1 or color 1F497D.
-    # Exact single-character values are still checked in real data fields.
-    return bool(re.search(r"(?<!\w)" + re.escape(value) + r"(?!\w)", PLACEHOLDER.sub(" ", field)))
+def technical_property(part, node):
+    """Schema-defined producer/version constants, never arbitrary author data."""
+    if part != "docProps/app.xml":
+        return False
+    value = node.text or ""
+    if local(node.tag) == "AppVersion":
+        return bool(re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,3}", value))
+    if local(node.tag) == "Application":
+        return bool(re.fullmatch(r"(?:Microsoft Excel(?: Compatible / Openpyxl [0-9.]+)?|"
+                                 r"Microsoft Macintosh Excel|LibreOffice(?:[/ ][0-9.]+)?|"
+                                 r"Openpyxl(?: [0-9.]+)?)", value))
+    return False
 
 
 class ValueScanner:
     """Aho-Corasick index: avoid values × fields quadratic residual scans."""
-    def __init__(self, values, budget):
+    def __init__(self, values, budget, maximum=200000):
         self.next, self.fail, self.ends = [{}], [0], [[]]
         self.budget = budget
         for number, value in enumerate(values):
@@ -140,6 +174,8 @@ class ValueScanner:
             state = 0
             for char in value:
                 if char not in self.next[state]:
+                    if len(self.next) >= maximum:
+                        raise XlsxError("Superato il budget dell'indice di verifica residui.")
                     self.next[state][char] = len(self.next)
                     self.next.append({}); self.fail.append(0); self.ends.append([])
                 state = self.next[state][char]
@@ -147,6 +183,8 @@ class ValueScanner:
         queue = deque(self.next[0].values())
         while queue:
             state = queue.popleft()
+            if state % 1024 == 0:
+                budget()
             for char, child in self.next[state].items():
                 queue.append(child)
                 fallback = self.fail[state]
@@ -171,9 +209,35 @@ class ValueScanner:
                     yield value
 
 
-def parse_xml(data):
+def parse_xml(data, maximum=200000, budget=lambda: None):
     try:
-        return fromstring(data, forbid_dtd=True, forbid_entities=True, forbid_external=True)
+        class Builder(ET.TreeBuilder):
+            def __init__(self):
+                super().__init__(insert_comments=True, insert_pis=True)
+                self.count = self.depth = 0
+
+            def start(self, tag, attrs):
+                self.count += 1
+                self.depth += 1
+                if self.count > maximum or self.depth > 64 or len(attrs) > 64:
+                    raise XlsxError("Superato il limite di nodi, profondità o attributi XML.")
+                return super().start(tag, attrs)
+
+            def end(self, tag):
+                self.depth -= 1
+                return super().end(tag)
+
+        parser = DefusedXMLParser(target=Builder(),
+                                  forbid_dtd=True, forbid_entities=True, forbid_external=True)
+        for offset in range(0, len(data), 65536):
+            budget()
+            parser.feed(data[offset:offset + 65536])
+        root = parser.close()
+        if any(not isinstance(n.tag, str) for n in root.iter()):
+            raise ValueError
+        return root
+    except XlsxError:
+        raise
     except Exception:
         raise XlsxError("XML non valido o non sicuro nel pacchetto XLSX.") from None
 
@@ -189,9 +253,12 @@ class Package:
         if len(data) > self.limits.compressed:
             raise XlsxError("Superato il limite di dimensione compressa XLSX.")
         self.roots = {}
+        node_count = 0
         try:
             with zipfile.ZipFile(io.BytesIO(data)) as archive:
                 infos = archive.infolist()
+                if archive.comment or any(i.comment or i.extra for i in infos):
+                    raise XlsxError("Commenti o campi ZIP aggiuntivi non supportati.")
                 if (len(infos) > self.limits.parts or
                         sum(i.file_size for i in infos) > self.limits.expanded):
                     raise XlsxError("Superato il limite di parti o dimensione ZIP decompressa.")
@@ -209,7 +276,8 @@ class Package:
                     raw = archive.read(info)
                     if len(raw) != info.file_size:
                         raise XlsxError("Dimensione ZIP non valida.")
-                    self.roots[info.filename] = parse_xml(raw)
+                    self.roots[info.filename] = parse_xml(raw, self.limits.xml_nodes - node_count, self.check_time)
+                    node_count += sum(1 for _ in self.roots[info.filename].iter())
         except XlsxError:
             raise
         except Exception:
@@ -223,6 +291,7 @@ class Package:
         self.slots = []
         self.cells = {}
         self.formulas = []
+        self.formula_literals = []
         self.names = []
         self._discover()
 
@@ -272,6 +341,21 @@ class Package:
                 if any(local(n.tag) not in SHEET_TAGS or
                        not n.tag.startswith("{" + MAIN + "}") for n in root.iter()):
                     raise XlsxError("Elemento del foglio non supportato (inclusi hyperlink interni/esterni).")
+            expected_tags = None
+            if part == "xl/workbook.xml":
+                expected_tags = WORKBOOK_TAGS
+            elif part == "xl/styles.xml":
+                expected_tags = STYLE_TAGS
+            elif part == "docProps/core.xml":
+                expected_tags = CORE_TAGS
+            elif part == "docProps/app.xml":
+                expected_tags = APP_TAGS
+            elif re.fullmatch(r"xl/(?:comments[0-9]+|comments/comment[0-9]+)\.xml", part):
+                expected_tags = COMMENT_TAGS
+            elif part == "xl/sharedStrings.xml":
+                expected_tags = COMMENT_TAGS | {"sst", "si"}
+            if expected_tags is not None and any(local(n.tag) not in expected_tags for n in root.iter()):
+                raise XlsxError("Elemento XML non supportato in proprietà, stili, nomi o commenti.")
             if part.endswith(".vml"):
                 # Legacy comments only; no images, arbitrary VML text or controls.
                 allowed = set("xml shapelayout idmap shapetype stroke path shape fill shadow "
@@ -279,6 +363,36 @@ class Package:
                               "Row Column Visible lock".split())
                 if any(local(n.tag) not in allowed for n in root.iter()):
                     raise XlsxError("Disegno VML non limitato a commenti semplici.")
+                allowed_attrs = set("ext data id coordsize spt path idmap type style fillcolor insetmode "
+                                    "color2 type on color obscured connecttype gradientshapeok extrusionok "
+                                    "ObjectType spid position inset editas joinstyle".split())
+                if any(local(k) not in allowed_attrs or any(word in v.casefold() for word in
+                           ("url(", "expression(", "javascript:", "data:", "http:", "https:"))
+                       for n in root.iter() for k, v in n.attrib.items()):
+                    raise XlsxError("Attributi VML non supportati o attivi.")
+                constants = {"edit", "202", "miter", "t", "f", "rect", "none", "auto", "Note",
+                             "black", "white", "single", "solid"}
+                for node in root.iter():
+                    for attr, value in node.attrib.items():
+                        if local(attr) == "style":
+                            for declaration in value.split(";"):
+                                if not declaration.strip():
+                                    continue
+                                pieces = declaration.strip().split(":")
+                                if len(pieces) != 2:
+                                    raise XlsxError("Stile VML non supportato.")
+                                key, val = (v.strip() for v in pieces)
+                                allowed_style = {
+                                    "position": r"absolute", "margin-left": r"[0-9.]+(?:pt|px)",
+                                    "margin-top": r"[0-9.]+(?:pt|px)", "width": r"[0-9.]+(?:pt|px)",
+                                    "height": r"[0-9.]+(?:pt|px)", "z-index": r"[0-9]+",
+                                    "visibility": r"hidden|visible", "mso-direction-alt": r"auto",
+                                    "text-align": r"left|right|center"}
+                                if key not in allowed_style or not re.fullmatch(allowed_style[key], val):
+                                    raise XlsxError("Stile VML non supportato.")
+                        elif value not in constants and not re.fullmatch(
+                                r"(?:#?_x0000_[st][0-9]+|#[A-Fa-f0-9]{6}|[0-9]+(?:,[0-9]+)?|[mlrcxev0-9,.\- ]+)", value):
+                            raise XlsxError("Valore VML non limitato alla geometria dei commenti.")
                 clients = [n for n in root.iter() if local(n.tag) == "ClientData"]
                 if not clients or any(n.get("ObjectType") != "Note" for n in clients):
                     raise XlsxError("Controlli VML non supportati.")
@@ -303,22 +417,39 @@ class Package:
     def _expand_strings(self):
         shared = self.roots.get("xl/sharedStrings.xml")
         strings = list(shared) if shared is not None else []
+        lengths = [len(text_of(s)) for s in strings]
+        if any(n > self.limits.cell_length for n in lengths) or sum(lengths) > self.limits.characters:
+            raise XlsxError("Superati i limiti delle stringhe condivise.")
+        count = characters = 0
         for part, root in self.roots.items():
             if not re.fullmatch(r"xl/worksheets/sheet[0-9]+\.xml", part):
                 continue
             for cell in root.findall(".//m:c", NS):
+                self.check_time()
+                count += 1
+                if count > self.limits.cells:
+                    raise XlsxError("Superato il limite di celle prima dell'espansione delle stringhe.")
                 if cell.get("t") == "s":
                     try:
                         index = int(cell.find("m:v", NS).text)
                         if index < 0:
                             raise ValueError
+                        characters += lengths[index]
+                        if characters > self.limits.characters:
+                            raise XlsxError("Superato il budget di espansione delle stringhe condivise.")
                         item = copy.deepcopy(strings[index])
+                    except XlsxError:
+                        raise
                     except Exception:
                         raise XlsxError("Indice di stringa condivisa non valido.") from None
                     item.tag = "{" + MAIN + "}is"
                     cell.remove(cell.find("m:v", NS))
                     cell.set("t", "inlineStr")
                     cell.append(item)
+                else:
+                    characters += len(text_of(cell))
+                if characters > self.limits.characters:
+                    raise XlsxError("Superato il budget di caratteri delle celle.")
         if shared is not None:
             del self.roots["xl/sharedStrings.xml"]
             for node in list(self.roots["[Content_Types].xml"]):
@@ -352,7 +483,7 @@ class Package:
         sheets = workbook.findall("m:sheets/m:sheet", NS)
         if not 0 < len(sheets) <= self.limits.sheets:
             raise XlsxError("Superato il limite di fogli o cartella vuota.")
-        processed, count, area = set(), 0, 0
+        processed, count, area, actual_area = set(), 0, 0, 0
         for index, sheet in enumerate(sheets):
             part = targets.get(sheet.get("{" + OREL + "}id"))
             if part not in self.roots or part in processed:
@@ -387,7 +518,11 @@ class Package:
                     if formula.attrib:
                         raise XlsxError("Formule condivise, matriciali o con attributi non supportate.")
                     refs = self._formula(formula.text or "")
-                    self.formulas.append((index, refs))
+                    self.formula_literals.extend(t.value for t in Tokenizer("=" + formula.text).items
+                                                 if t.type == "OPERAND" and t.subtype == "NUMBER")
+                    if any((c - a + 1) * (d - b + 1) > self.limits.cells for a, b, c, d in refs):
+                        raise XlsxError("Intervallo di formula fuori dal budget di celle.")
+                    self.formulas.append((index, coordinate, refs))
                     for cached in list(cell.findall("m:v", NS)):
                         cell.remove(cached)
                     continue
@@ -406,6 +541,9 @@ class Package:
                                row=row, column=col, cell_type=cell.get("t"))
             self.sheets.append({"index": index, "name": title, "state": sheet.get("state", "visible"),
                                 "rows": max_row, "columns": max_col})
+            actual_area += max_row * max_col
+            if actual_area > self.limits.cells:
+                raise XlsxError("Superato il limite dell'area reale dei fogli.")
             for node in root.iter():
                 if local(node.tag) in {"oddHeader", "oddFooter", "evenHeader", "evenFooter",
                                        "firstHeader", "firstFooter"} and node.text:
@@ -425,8 +563,17 @@ class Package:
                 raise XlsxError("Nomi definiti: supportati solo riferimenti statici a intervalli locali.")
         for part, root in self.roots.items():
             if part.startswith("docProps/") or re.fullmatch(r"xl/(?:comments[0-9]+|comments/comment[0-9]+)\.xml", part):
+                if part.startswith("xl/"):
+                    for node in root.iter():
+                        if local(node.tag) == "author" and node.text:
+                            self._slot(part, node, node.text, field="author")
+                        elif local(node.tag) == "text" and text_of(node):
+                            self._slot(part, node, text_of(node), field="comment", rich=True)
+                    continue
                 for node in root.iter():
                     if node.text and node.text.strip():
+                        if technical_property(part, node):
+                            continue
                         tag = local(node.tag)
                         kind = "text"
                         if part.startswith("docProps/"):
@@ -468,15 +615,16 @@ class Package:
             node = slot["node"]
             if slot.get("attribute"):
                 covered_attrs.add((id(node), slot["attribute"]))
-            elif "cell" in slot:
+            elif "cell" in slot or slot.get("rich"):
                 covered_text.update(id(n) for n in node.iter())
             else:
                 covered_text.add(id(node))
         for part, root in self.roots.items():
-            if part.startswith("xl/theme/"):
+            if part.startswith("xl/theme/") or part.endswith(".vml"):
                 continue  # exact, preflight-verified technical boilerplate
             for node in root.iter():
-                if id(node) not in covered_text and (node.text or "").strip():
+                if (id(node) not in covered_text and (node.text or "").strip() and
+                        not technical_property(part, node) and local(node.tag) != "f"):
                     fields.append(node.text)
                 # Ignore only package/schema identifiers, whose values were
                 # validated by preflight, and standard namespace URI constants.
@@ -487,6 +635,8 @@ class Package:
                         continue
                     technical = (re.fullmatch(r"[+-]?[0-9]+(?:\.[0-9]+)?", value) or
                                  CELL_REF.fullmatch(value) or re.fullmatch(r"rId[0-9]+", value) or
+                                 (local(attr) == "id" and value in {"anysvml", "comments"}) or
+                                 re.fullmatch(r"#?_x0000_[st][0-9]+", value) or
                                  (attr in {"rgb", "val"} and re.fullmatch(r"[A-Fa-f0-9]{6,8}", value)))
                     safe_font = local(node.tag) == "name" and attr == "val" and value in {
                         "Calibri", "Arial", "Times New Roman", "Cambria", "Helvetica", "Verdana",
@@ -514,7 +664,7 @@ class Package:
                 if token.subtype == "OPEN" and token.value.upper() not in {
                         "SUM(", "MIN(", "MAX(", "AVERAGE(", "COUNT(", "ABS(", "ROUND("}:
                     raise XlsxError("Funzione Excel non supportata.")
-            elif token.type not in {"OP_PRE", "OP_IN", "OP_POST", "PAREN", "SEP", "WHITE-SPACE"}:
+            elif token.type not in {"OPERATOR-PREFIX", "OPERATOR-INFIX", "OPERATOR-POSTFIX", "PAREN", "SEP", "WHITE-SPACE"}:
                 raise XlsxError("Formula non supportata.")
         if not tokens:
             raise XlsxError("Formula vuota non supportata.")
@@ -584,9 +734,25 @@ class WorkbookJob:
             if (sheet, column) in indexed_rules:
                 raise XlsxError("Regole duplicate per una colonna.")
             indexed_rules[sheet, column] = (header, start, category)
+        header_rows = config.get("header_rows", {})
+        if (not isinstance(header_rows, dict) or any(
+                not isinstance(key, str) or not key.isdigit() or int(key) >= len(p.sheets) or
+                type(row) is not int or row < 0 for key, row in header_rows.items())):
+            raise XlsxError("Righe di intestazione non valide.")
+        headers = {(s.get("sheet"), s.get("row"), s.get("column")): s["value"][:256]
+                   for s in p.slots if "cell" in s}
         # Sheet and defined names and style metadata cannot be changed safely:
         # detect with no exclusions, then fail closed if personal data is found.
+        for sheet, coordinate, refs in p.formulas:
+            col, row, _, _ = range_boundaries(coordinate)
+            rule = indexed_rules.get((sheet, col))
+            if rule and row >= rule[1] and row != rule[0]:
+                raise XlsxError("Una colonna obbligatoria contiene formule: convertirle prima in valori.")
         checked_names = list(dict.fromkeys(p.names + p.static_fields))
+        if any(detect_regex(value) for value in p.formula_literals):
+            raise XlsxError("Possibili identificativi personali nei valori costanti delle formule.")
+        if any(re.search(r"_x[0-9a-fA-F]{4}_", name) for name in checked_names):
+            raise XlsxError("Escape OOXML non supportati nei nomi o nei metadati.")
         for offset in range(0, len(checked_names), 16):
             p.check_time()
             if any(detect_batch(checked_names[offset:offset + 16])):
@@ -600,7 +766,7 @@ class WorkbookJob:
             p.check_time()
             batch = slots[offset:offset + 16]
             # Each cell is a separate sample: no entity can cross a cell boundary.
-            detections = detect_batch([s["value"] for s in batch])
+            detections = detect_batch([detector_text(s) for s in batch])
             if len(detections) != len(batch):
                 raise XlsxError("Risposta del motore di riconoscimento non valida.")
             for slot, entities in zip(batch, detections):
@@ -617,6 +783,20 @@ class WorkbookJob:
                     entities = []
                 else:
                     entities = [e for e in entities if e["label"] not in self.excluded]
+                    if "cell" in slot and automatic:
+                        header_row = rule[0] if rule else header_rows.get(str(slot["sheet"]), 1)
+                        header = headers.get((slot["sheet"], header_row, slot["column"]), "").casefold().strip()
+                        hint = None
+                        for category, pattern in (
+                                ("CF", r"(?:c\.?\s*f\.?|codice fiscale)"),
+                                ("PIVA", r"(?:p\.?\s*iva|partita iva)"),
+                                ("TELEPHONENUM", r"(?:telefono|cellulare|phone|mobile)"),
+                                ("ID", r"(?:matricola|codice utenza|numero cliente|customer id|identificativo)")):
+                            if re.fullmatch(pattern, header):
+                                hint = category
+                                break
+                        if hint and hint not in self.excluded and slot["row"] != header_row:
+                            entities = [{"start": 0, "end": len(slot["value"]), "label": hint, "source": "header"}]
                 for entity in entities:
                     start, end, category = entity["start"], entity["end"], entity["label"]
                     if not 0 <= start < end <= len(slot["value"]):
@@ -628,11 +808,13 @@ class WorkbookJob:
                     if any(c["slot"] == slot["id"] and c["start"] < end and start < c["end"]
                            for c in self.changes):
                         continue
-                    ph = self.session.placeholder(category, slot["value"][start:end], slot["kind"])
-                    ph = NEUTRAL.get(slot["kind"], ph)
+                    association = self.session.placeholder(category, slot["value"][start:end], slot["kind"])
+                    ph = NEUTRAL.get(slot["kind"], association)
                     self.changes.append({"id": len(self.changes), "slot": slot["id"],
                                          "start": start, "end": end, "category": category,
                                          "replacement": ph, "enabled": True,
+                                         "association": association,
+                                         "source": entity.get("source", "forced" if entity.get("forced") else "automatic"),
                                          "forced": bool(entity.get("forced")),
                                          "conflict": bool(entity.get("forced") and category in self.excluded)})
             self.progress = {"phase": "analysis", "completed": min(offset + 16, len(slots)), "total": len(slots)}
@@ -650,13 +832,29 @@ class WorkbookJob:
         result = []
         for change in self.changes[page * size:(page + 1) * size]:
             slot = self.package.slots[change["slot"]]
-            item = {k: v for k, v in change.items() if k != "slot"}
+            item = {k: v for k, v in change.items() if k not in {"slot", "association"}}
             item.update({"slot": slot["id"], "sheet": slot.get("sheet"),
                          "cell": slot.get("cell"), "field": slot.get("field", "cell")})
             if self.session.mapping_enabled:
-                item["original"] = slot["value"][change["start"]:change["end"]]
+                original = slot["value"][change["start"]:change["end"]]
+                item["original"] = original[:240]
+                item["original_truncated"] = len(original) > 240
             result.append(item)
         return {"page": page, "size": size, "total": len(self.changes), "items": result}
+
+    def fields(self, page=0, size=25, scope="metadata"):
+        if not self.analysed or page < 0 or not 1 <= size <= 100 or scope not in {"metadata", "cells", "all"}:
+            raise XlsxError("Richiesta campi non valida.")
+        slots = [s for s in self.package.slots if scope == "all" or
+                 (("cell" in s) == (scope == "cells"))]
+        items = []
+        for slot in slots[page * size:(page + 1) * size]:
+            item = {"slot": slot["id"], "sheet": slot.get("sheet"), "cell": slot.get("cell"),
+                    "field": slot.get("field", "cell"), "kind": slot["kind"]}
+            if self.session.mapping_enabled:
+                item.update(value=slot["value"][:240], truncated=len(slot["value"]) > 240)
+            items.append(item)
+        return {"total": len(slots), "page": page, "size": size, "items": items}
 
     def correct(self, edit):
         if not self.analysed or not isinstance(edit, dict):
@@ -668,7 +866,7 @@ class WorkbookJob:
         if edit.get("scope", "occurrence") not in {"occurrence", "associated"}:
             raise XlsxError("Ambito di correzione non valido.")
         targets = [change] if edit.get("scope", "occurrence") == "occurrence" else [
-            c for c in self.changes if c["replacement"] == change["replacement"]]
+            c for c in self.changes if c["association"] == change["association"]]
         if "enabled" in edit and not isinstance(edit["enabled"], bool):
             raise XlsxError("enabled deve essere booleano.")
         if "enabled" in edit and not edit["enabled"] and any(c["forced"] for c in targets):
@@ -676,12 +874,12 @@ class WorkbookJob:
         if "category" in edit:
             slot = self.package.slots[change["slot"]]
             try:
-                ph = self.session.placeholder(edit["category"], slot["value"][change["start"]:change["end"]], slot["kind"])
-                ph = NEUTRAL.get(slot["kind"], ph)
+                association = self.session.placeholder(edit["category"], slot["value"][change["start"]:change["end"]], slot["kind"])
+                ph = NEUTRAL.get(slot["kind"], association)
             except ValueError:
                 raise XlsxError("Categoria non valida.") from None
             for target in targets:
-                target.update(category=edit["category"], replacement=ph)
+                target.update(category=edit["category"], replacement=ph, association=association)
         for target in targets:
             if "enabled" in edit:
                 target["enabled"] = edit["enabled"]
@@ -706,12 +904,13 @@ class WorkbookJob:
             raise XlsxError("Sostituzioni sovrapposte: escludere prima la proposta esistente.")
         category = edit.get("category", "ID")
         try:
-            ph = self.session.placeholder(category, slot["value"][start:end], slot["kind"])
-            ph = NEUTRAL.get(slot["kind"], ph)
+            association = self.session.placeholder(category, slot["value"][start:end], slot["kind"])
+            ph = NEUTRAL.get(slot["kind"], association)
         except ValueError:
             raise XlsxError("Categoria non valida.") from None
         self.changes.append({"id": len(self.changes), "slot": slot_id, "start": start, "end": end,
                              "category": category, "replacement": ph, "enabled": True,
+                             "association": association,
                              "forced": False, "conflict": False})
         self.output = self.dictionary = None
 
@@ -721,6 +920,11 @@ class WorkbookJob:
         if "cell" not in slot:
             if slot.get("attribute"):
                 node.set(slot["attribute"], value)
+            elif slot.get("rich"):
+                node.clear()
+                text = ET.SubElement(node, "{" + MAIN + "}t")
+                text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                text.text = value
             else:
                 node.text = value
             return
@@ -753,7 +957,7 @@ class WorkbookJob:
         active = [c for c in self.changes if c["enabled"]]
         modified_cells = { (p.slots[c["slot"]].get("sheet"), p.slots[c["slot"]].get("cell"))
                            for c in active if "cell" in p.slots[c["slot"]] }
-        for sheet, refs in p.formulas:
+        for sheet, coordinate, refs in p.formulas:
             for row_sheet, coordinate in modified_cells:
                 if row_sheet != sheet:
                     continue
@@ -782,10 +986,10 @@ class WorkbookJob:
         data = working.serialize()
         p.check_time()
         verified = Package(data, limits=p.limits)
-        self._verify_structure(data, p, verified)
-        scanner = ValueScanner({v for v, k in known_values if k == "text"}, p.check_time)
+        self._verify_structure(data, working, verified)
+        scanner = ValueScanner({v for v, k in known_values if k == "text"}, p.check_time, p.limits.scan_nodes)
         typed_values = {v for v, k in known_values if k != "text"}
-        for field in verified.static_fields:
+        for field in verified.static_fields + verified.formula_literals:
             if field in typed_values or next(scanner.find(field), None) is not None:
                 raise XlsxError("Verifica residui fallita nei nomi, stili o metadati non modificabili.")
         # Scan every accepted XML scalar, including metadata, relations and caches.
@@ -811,7 +1015,7 @@ class WorkbookJob:
             p.check_time()
             batch = verified.slots[offset:offset + 16]
             clean = ["" if s["kind"] in NEUTRAL and s["value"] == NEUTRAL[s["kind"]]
-                     else PLACEHOLDER.sub(" ", s["value"]) for s in batch]
+                     else PLACEHOLDER.sub(" ", detector_text(s)) for s in batch]
             results = detect_batch(clean)
             for slot, value, entities in zip(batch, clean, results):
                 for entity in entities:
@@ -832,8 +1036,11 @@ class WorkbookJob:
     def _verify_structure(data, source, output):
         if source.sheets != output.sheets or len(source.cells) != len(output.cells):
             raise XlsxError("Verifica strutturale XLSX fallita.")
+        if source.roots.keys() != output.roots.keys() or any(
+                xml_bytes(root) != xml_bytes(output.roots[part]) for part, root in source.roots.items()):
+            raise XlsxError("Gli invarianti del pacchetto XLSX esportato non corrispondono.")
         try:
-            book = load_workbook(io.BytesIO(data), read_only=True, data_only=False, keep_links=False)
+            book = load_workbook(io.BytesIO(data), read_only=False, data_only=False, keep_links=False)
             if len(book.worksheets) != len(source.sheets):
                 raise ValueError
             book.close()

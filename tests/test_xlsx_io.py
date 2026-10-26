@@ -231,7 +231,7 @@ class XlsxFlow(unittest.TestCase):
     def test_zip_cell_sheet_character_and_time_limits(self):
         raw = save(workbook())
         for limits in [Limits(compressed=1), Limits(expanded=1), Limits(parts=1),
-                       Limits(cells=1), Limits(cell_length=4), Limits(characters=1)]:
+                       Limits(cells=1), Limits(cell_length=4), Limits(characters=1), Limits(xml_nodes=3)]:
             with self.subTest(limits=limits), self.assertRaises(XlsxError):
                 WorkbookJob(raw, limits=limits)
         book = workbook(); book.create_sheet("Secondo")
@@ -311,6 +311,141 @@ class XlsxFlow(unittest.TestCase):
         second = job.export(fake_batch)
         self.assertEqual(load_workbook(io.BytesIO(first)).active["A2"].value,
                          load_workbook(io.BytesIO(second)).active["A2"].value)
+
+    def test_header_context_numeric_identifier_and_configurable_header_row(self):
+        book = workbook({"A1": "Esempio", "A3": "Matricola", "A4": 5432187, "B4": 88})
+        job = self.job(book, {"header_rows": {"0": 3}})
+        change = next(c for c in job.changes if job.package.slots[c["slot"]].get("cell") == "A4")
+        self.assertEqual(change["category"], "ID")
+        self.assertEqual(change["source"], "header")
+        job.export(fake_batch)
+        excluded = self.job(book, {"header_rows": {"0": 3}, "exclude_tags": ["ID"]})
+        self.assertFalse(any(excluded.package.slots[c["slot"]].get("cell") == "A4" for c in excluded.changes))
+
+    def test_shared_strings_and_orphan_strings_removed(self):
+        book = workbook({"A1": "shared", "A2": "shared"})
+        raw = save(book)
+        def replace_sheet(value):
+            return value.replace(b'<c r="A1" t="inlineStr"><is><t>shared</t></is></c>',
+                                 b'<c r="A1" t="s"><v>0</v></c>').replace(
+                                 b'<c r="A2" t="inlineStr"><is><t>shared</t></is></c>',
+                                 b'<c r="A2" t="s"><v>0</v></c>')
+        raw = mutate(raw, {
+            "xl/sharedStrings.xml": ('<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                                      '<si><t>' + EMAIL + '</t></si><si><t>unused-secret@example.invalid</t></si></sst>').encode(),
+            "xl/worksheets/sheet1.xml": replace_sheet,
+            "xl/_rels/workbook.xml.rels": lambda v: v.replace(b'</Relationships>',
+                b'<Relationship Id="rId20" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/></Relationships>'),
+            "[Content_Types].xml": lambda v: v.replace(b'</Types>',
+                b'<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>')})
+        job = WorkbookJob(raw); job.analyze(fake_batch, {})
+        out = job.export(fake_batch)
+        with zipfile.ZipFile(io.BytesIO(out)) as archive:
+            self.assertNotIn("xl/sharedStrings.xml", archive.namelist())
+            self.assertFalse(any(b"unused-secret" in archive.read(p) for p in archive.namelist()))
+        restored = load_workbook(io.BytesIO(restore(out, job.dictionary)))
+        self.assertEqual(restored.active["A1"].value, EMAIL)
+        self.assertEqual(restored.active["A2"].value, EMAIL)
+
+    def test_header_control_codes_preserved_and_rich_comments_joined(self):
+        book = workbook({"A1": "Note"})
+        book.active.oddHeader.center.text = EMAIL
+        book.active["A1"].comment = Comment(EMAIL, "Autore sintetico")
+        raw = mutate(save(book), {"xl/comments/comment1.xml": lambda v: v.replace(
+            ('<text><t>' + EMAIL + '</t></text>').encode(),
+            b'<text><r><t>sintetico@</t></r><r><t>example.invalid</t></r></text>')})
+        job = WorkbookJob(raw); job.analyze(fake_batch, {})
+        out = load_workbook(io.BytesIO(job.export(fake_batch)))
+        self.assertTrue(out.active.oddHeader.center.text.startswith("[[RZ_"))
+        restored = load_workbook(io.BytesIO(restore(job.output, job.dictionary)))
+        self.assertEqual(restored.active["A1"].comment.text, EMAIL)
+        self.assertEqual(restored.active.oddHeader.center.text, EMAIL)
+
+    def test_typed_metadata_uses_valid_neutral_value_and_restores(self):
+        from xlsx_io import NEUTRAL
+        book = workbook()
+        book.properties.created = datetime.datetime(2025, 5, 6, 12, 30)
+        raw = save(book)
+        def metadata_date_detector(texts):
+            results = fake_batch(texts)
+            for text, entities in zip(texts, results):
+                if text.startswith("2025-05-06T"):
+                    entities.append({"start": 0, "end": len(text), "label": "DATE"})
+            return results
+        job = WorkbookJob(raw); job.analyze(metadata_date_detector, {})
+        out = job.export(metadata_date_detector)
+        self.assertEqual(load_workbook(io.BytesIO(out)).properties.created.year, 2000)
+        restored = load_workbook(io.BytesIO(restore(out, job.dictionary)))
+        self.assertEqual(restored.properties.created, book.properties.created)
+        self.assertIn(NEUTRAL["metadata_date"], {c["replacement"] for c in job.changes})
+
+    def test_unknown_xml_nodes_escapes_dtd_and_comments_blocked(self):
+        raw = save(workbook())
+        cases = [
+            {"xl/workbook.xml": lambda v: v.replace(b'</workbook>', b'<unknown>hidden</unknown></workbook>')},
+            {"xl/worksheets/sheet1.xml": lambda v: v.replace(b'</worksheet>', b'<extLst/></worksheet>')},
+            {"docProps/core.xml": lambda v: v.replace(b'</cp:coreProperties>', b'<unknown>hidden</unknown></cp:coreProperties>')},
+            {"xl/worksheets/sheet1.xml": lambda v: v.replace(EMAIL.encode(), b'sintetico_x0040_example.invalid')},
+            {"xl/workbook.xml": lambda v: b'<!DOCTYPE foo [<!ENTITY bar "unsafe">]>' + v},
+            {"xl/workbook.xml": lambda v: v.replace(b'</workbook>', b'<!-- unsupported --> </workbook>')},
+            {"xl/theme/theme1.xml": lambda v: v.replace(b'Office Theme', b'Custom Theme')},
+        ]
+        for updates in cases:
+            with self.subTest(part=next(iter(updates))), self.assertRaises(XlsxError):
+                WorkbookJob(mutate(raw, updates))
+
+    def test_custom_number_format_with_personal_text_blocks(self):
+        book = workbook()
+        book.active["B2"] = 12
+        book.active["B2"].number_format = '0 "' + EMAIL + '"'
+        with self.assertRaisesRegex(XlsxError, "nomi"):
+            self.job(book)
+
+    def test_formula_cache_cleared_and_forced_formula_rejected(self):
+        book = workbook({"A1": 42, "B1": "=A1+1"})
+        raw = mutate(save(book), {"xl/worksheets/sheet1.xml": lambda v: v.replace(b'<v></v>', ('<v>' + EMAIL + '</v>').encode())})
+        job = WorkbookJob(raw); job.analyze(fake_batch, {})
+        with zipfile.ZipFile(io.BytesIO(job.export(fake_batch))) as archive:
+            self.assertNotIn(EMAIL.encode(), archive.read("xl/worksheets/sheet1.xml"))
+        with self.assertRaisesRegex(XlsxError, "obbligatoria contiene formule"):
+            self.job(book, {"columns": [{"sheet": 0, "column": 2, "header_row": 0, "start_row": 1}]})
+        with self.assertRaises(XlsxError):
+            WorkbookJob(save(workbook({"A1": "=SUM(A1:XFD1048576)"})))
+
+    def test_structural_tampering_blocks_export(self):
+        original = Package.serialize
+        def tamper(package):
+            return mutate(original(package), {"xl/styles.xml": lambda v: v.replace(b'Calibri', b'Arial')})
+        job = self.job()
+        with patch.object(Package, "serialize", tamper), self.assertRaisesRegex(XlsxError, "invarianti"):
+            job.export(fake_batch)
+        self.assertIsNone(job.output)
+
+    def test_residual_index_and_missing_mapping_entries_limits(self):
+        job = WorkbookJob(save(workbook()), limits=Limits(scan_nodes=3))
+        job.analyze(fake_batch, {})
+        with self.assertRaisesRegex(XlsxError, "indice"):
+            job.export(fake_batch)
+        job = self.job(); raw = job.export(fake_batch)
+        bad = copy.deepcopy(job.dictionary); bad["edits"] = []
+        with self.assertRaisesRegex(XlsxError, "incompleto"):
+            restore(raw, bad)
+
+    def test_zip_comments_and_duplicate_parts_rejected(self):
+        raw = save(workbook())
+        stream = io.BytesIO(raw)
+        with zipfile.ZipFile(stream, "a") as archive:
+            archive.comment = b"uninspectable metadata"
+        with self.assertRaisesRegex(XlsxError, "ZIP"):
+            WorkbookJob(stream.getvalue())
+        stream = io.BytesIO(raw)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with zipfile.ZipFile(stream, "a") as archive:
+                archive.writestr("xl/workbook.xml", b"duplicate")
+        with self.assertRaisesRegex(XlsxError, "duplicate"):
+            WorkbookJob(stream.getvalue())
 
 
 if __name__ == "__main__":
